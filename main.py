@@ -103,21 +103,61 @@ def process_session_photos(session_id: str):
     cursor.execute("SELECT id, filepath FROM photos WHERE session_id = ?", (session_id,))
     photos = cursor.fetchall()
     
+    analyzed_photos = []
+
+    # 1. Analisa individualmente cada foto
     for photo_id, filepath in photos:
         blur, exposure, phash = analyze_photo(filepath)
-        recommendation = "Recomendada" if blur > 60.0 and exposure == "Equilibrada" else "Revisar"
-        # Fotos recomendadas iniciam pré-selecionadas (1), foto para revisar iniciam desmarcadas (0)
-        selected = 1 if recommendation == "Recomendada" else 0
+        analyzed_photos.append({
+            "id": photo_id,
+            "blur": blur,
+            "exposure": exposure,
+            "phash": phash,
+            "is_duplicate": False
+        })
         
+        cursor.execute("UPDATE sessions SET processed_photos = processed_photos + 1 WHERE id = ?", (session_id,))
+        conn.commit()
+
+    # 2. Agrupa e detecta fotos semelhantes/duplicadas via pHash
+    for i in range(len(analyzed_photos)):
+        if analyzed_photos[i]["phash"] == "":
+            continue
+            
+        hash_i = imagehash.hex_to_hash(analyzed_photos[i]["phash"])
+        
+        for j in range(i + 1, len(analyzed_photos)):
+            if analyzed_photos[j]["phash"] == "":
+                continue
+                
+            hash_j = imagehash.hex_to_hash(analyzed_photos[j]["phash"])
+            
+            # Se a distância perceptual for menor que 10, são praticamente a mesma foto
+            if (hash_i - hash_j) <= 10:
+                # Marca a foto de menor nitidez como duplicada
+                if analyzed_photos[i]["blur"] >= analyzed_photos[j]["blur"]:
+                    analyzed_photos[j]["is_duplicate"] = True
+                else:
+                    analyzed_photos[i]["is_duplicate"] = True
+
+    # 3. Atualiza os status no Banco de Dados
+    for item in analyzed_photos:
+        if item["is_duplicate"]:
+            recommendation = "Duplicada"
+            selected = 0
+        elif item["blur"] > 60.0 and item["exposure"] == "Equilibrada":
+            recommendation = "Recomendada"
+            selected = 1
+        else:
+            recommendation = "Revisar"
+            selected = 0
+
         cursor.execute('''
             UPDATE photos 
             SET blur_score = ?, exposure_status = ?, phash = ?, recommendation = ?, selected = ?
             WHERE id = ?
-        ''', (blur, exposure, phash, recommendation, selected, photo_id))
-        
-        cursor.execute("UPDATE sessions SET processed_photos = processed_photos + 1 WHERE id = ?", (session_id,))
-        conn.commit()
-        
+        ''', (item["blur"], item["exposure"], item["phash"], recommendation, selected, item["id"]))
+    
     cursor.execute("UPDATE sessions SET status = 'Concluída' WHERE id = ?", (session_id,))
     conn.commit()
     conn.close()
@@ -191,7 +231,6 @@ def get_session(session_id: str):
         ]
     }
 
-# Rota para atualizar a seleção/aprovação individual da foto
 @app.post("/api/photos/select")
 def select_photo(payload: PhotoSelectPayload):
     conn = sqlite3.connect(DB_PATH)
@@ -201,7 +240,6 @@ def select_photo(payload: PhotoSelectPayload):
     conn.close()
     return {"status": "ok", "photo_id": payload.photo_id, "selected": payload.selected}
 
-# Exporta estritamente apenas as fotos com selected = 1 (Aprovadas)
 @app.get("/api/sessions/{session_id}/export")
 def export_selected_photos(session_id: str):
     conn = sqlite3.connect(DB_PATH)
