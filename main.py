@@ -10,6 +10,7 @@ from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 from typing import List
 import uuid
 
@@ -30,8 +31,11 @@ DB_PATH = "./storage/database.db"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
-# Serve as imagens enviadas estaticamente para exibição no frontend
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+
+class PhotoSelectPayload(BaseModel):
+    photo_id: str
+    selected: bool
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -55,7 +59,7 @@ def init_db():
             exposure_status TEXT,
             phash TEXT,
             recommendation TEXT,
-            selected INTEGER DEFAULT 1
+            selected INTEGER DEFAULT 0
         )
     ''')
     conn.commit()
@@ -102,12 +106,14 @@ def process_session_photos(session_id: str):
     for photo_id, filepath in photos:
         blur, exposure, phash = analyze_photo(filepath)
         recommendation = "Recomendada" if blur > 60.0 and exposure == "Equilibrada" else "Revisar"
+        # Fotos recomendadas iniciam pré-selecionadas (1), foto para revisar iniciam desmarcadas (0)
+        selected = 1 if recommendation == "Recomendada" else 0
         
         cursor.execute('''
             UPDATE photos 
-            SET blur_score = ?, exposure_status = ?, phash = ?, recommendation = ?
+            SET blur_score = ?, exposure_status = ?, phash = ?, recommendation = ?, selected = ?
             WHERE id = ?
-        ''', (blur, exposure, phash, recommendation, photo_id))
+        ''', (blur, exposure, phash, recommendation, selected, photo_id))
         
         cursor.execute("UPDATE sessions SET processed_photos = processed_photos + 1 WHERE id = ?", (session_id,))
         conn.commit()
@@ -185,7 +191,17 @@ def get_session(session_id: str):
         ]
     }
 
-# Rota para exportar as fotos selecionadas em arquivo ZIP
+# Rota para atualizar a seleção/aprovação individual da foto
+@app.post("/api/photos/select")
+def select_photo(payload: PhotoSelectPayload):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE photos SET selected = ? WHERE id = ?", (1 if payload.selected else 0, payload.photo_id))
+    conn.commit()
+    conn.close()
+    return {"status": "ok", "photo_id": payload.photo_id, "selected": payload.selected}
+
+# Exporta estritamente apenas as fotos com selected = 1 (Aprovadas)
 @app.get("/api/sessions/{session_id}/export")
 def export_selected_photos(session_id: str):
     conn = sqlite3.connect(DB_PATH)
@@ -195,7 +211,7 @@ def export_selected_photos(session_id: str):
     conn.close()
 
     if not photos:
-        raise HTTPException(status_code=400, detail="Nenhuma foto selecionada para exportação")
+        raise HTTPException(status_code=400, detail="Nenhuma foto aprovada/selecionada para exportação.")
 
     zip_filename = f"selecao_{session_id[:8]}.zip"
     zip_path = os.path.join(EXPORT_DIR, zip_filename)
