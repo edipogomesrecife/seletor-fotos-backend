@@ -61,13 +61,21 @@ def init_db():
 
 init_db()
 
-# Algoritmos de Análise de Imagem (OpenCV / ImageHash)
+# Algoritmos de Análise de Imagem Otimizados para Baixo Consumo de RAM
 def analyze_photo(filepath: str):
-    # 1. Análise de Nitidez via Variância do Laplaciano
+    # Carrega a imagem em escala de cinza
     img_cv = cv2.imread(filepath, cv2.IMREAD_GRAYSCALE)
     if img_cv is None:
         return 0.0, "Erro", ""
     
+    # Redimensiona mantendo a proporção (máximo 1024px) para economizar RAM
+    h, w = img_cv.shape[:2]
+    max_dim = 1024
+    if h > max_dim or w > max_dim:
+        scale = max_dim / float(max(h, w))
+        img_cv = cv2.resize(img_cv, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
+    # 1. Análise de Nitidez via Variância do Laplaciano
     blur_score = cv2.Laplacian(img_cv, cv2.CV_64F).var()
     
     # 2. Análise de Exposição via Histograma
@@ -82,9 +90,10 @@ def analyze_photo(filepath: str):
     elif over_exposed > 0.30:
         exposure_status = "Superexposta"
 
-    # 3. Hash Perceptual (pHash) para Imagens Semelhantes
-    pil_img = Image.open(filepath)
-    phash_val = str(imagehash.phash(pil_img))
+    # 3. Hash Perceptual (pHash) otimizado em escala reduzida
+    with Image.open(filepath) as pil_img:
+        pil_img.thumbnail((512, 512))
+        phash_val = str(imagehash.phash(pil_img))
     
     return round(blur_score, 2), exposure_status, phash_val
 
@@ -96,7 +105,9 @@ def process_session_photos(session_id: str):
     
     for photo_id, filepath in photos:
         blur, exposure, phash = analyze_photo(filepath)
-        recommendation = "Recomendada" if blur > 100.0 and exposure == "Equilibrada" else "Revisar"
+        
+        # Limiar de nitidez calibrado para 60.0
+        recommendation = "Recomendada" if blur > 60.0 and exposure == "Equilibrada" else "Revisar"
         
         cursor.execute('''
             UPDATE photos 
