@@ -8,13 +8,13 @@ import numpy as np
 from PIL import Image
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from typing import List
 import uuid
 
 app = FastAPI(title="Seletor Inteligente de Fotografias - API")
 
-# Permite chamadas do frontend hospedado na Vercel
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,7 +30,9 @@ DB_PATH = "./storage/database.db"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
-# Inicialização do Banco de Dados SQLite
+# Serve as imagens enviadas estaticamente para exibição no frontend
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -61,24 +63,19 @@ def init_db():
 
 init_db()
 
-# Algoritmos de Análise de Imagem Otimizados para Baixo Consumo de RAM
 def analyze_photo(filepath: str):
-    # Carrega a imagem em escala de cinza
     img_cv = cv2.imread(filepath, cv2.IMREAD_GRAYSCALE)
     if img_cv is None:
         return 0.0, "Erro", ""
     
-    # Redimensiona mantendo a proporção (máximo 1024px) para economizar RAM
     h, w = img_cv.shape[:2]
     max_dim = 1024
     if h > max_dim or w > max_dim:
         scale = max_dim / float(max(h, w))
         img_cv = cv2.resize(img_cv, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
-    # 1. Análise de Nitidez via Variância do Laplaciano
     blur_score = cv2.Laplacian(img_cv, cv2.CV_64F).var()
     
-    # 2. Análise de Exposição via Histograma
     hist = cv2.calcHist([img_cv], [0], None, [256], [0, 256])
     total_pixels = img_cv.size
     under_exposed = np.sum(hist[:30]) / total_pixels
@@ -90,7 +87,6 @@ def analyze_photo(filepath: str):
     elif over_exposed > 0.30:
         exposure_status = "Superexposta"
 
-    # 3. Hash Perceptual (pHash) otimizado em escala reduzida
     with Image.open(filepath) as pil_img:
         pil_img.thumbnail((512, 512))
         phash_val = str(imagehash.phash(pil_img))
@@ -105,8 +101,6 @@ def process_session_photos(session_id: str):
     
     for photo_id, filepath in photos:
         blur, exposure, phash = analyze_photo(filepath)
-        
-        # Limiar de nitidez calibrado para 60.0
         recommendation = "Recomendada" if blur > 60.0 and exposure == "Equilibrada" else "Revisar"
         
         cursor.execute('''
@@ -122,7 +116,6 @@ def process_session_photos(session_id: str):
     conn.commit()
     conn.close()
 
-# Rotas da API
 @app.post("/api/sessions")
 def create_session(title: str = "Nova Análise"):
     session_id = str(uuid.uuid4())
@@ -186,7 +179,30 @@ def get_session(session_id: str):
                 "blur_score": p[2],
                 "exposure_status": p[3],
                 "recommendation": p[4],
-                "selected": bool(p[5])
+                "selected": bool(p[5]),
+                "url": f"/uploads/{session_id}/{p[1]}"
             } for p in photos
         ]
     }
+
+# Rota para exportar as fotos selecionadas em arquivo ZIP
+@app.get("/api/sessions/{session_id}/export")
+def export_selected_photos(session_id: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT filename, filepath FROM photos WHERE session_id = ? AND selected = 1", (session_id,))
+    photos = cursor.fetchall()
+    conn.close()
+
+    if not photos:
+        raise HTTPException(status_code=400, detail="Nenhuma foto selecionada para exportação")
+
+    zip_filename = f"selecao_{session_id[:8]}.zip"
+    zip_path = os.path.join(EXPORT_DIR, zip_filename)
+
+    with zipfile.ZipFile(zip_path, 'w') as zipf:
+        for filename, filepath in photos:
+            if os.path.exists(filepath):
+                zipf.write(filepath, arcname=filename)
+
+    return FileResponse(zip_path, filename=zip_filename, media_type="application/zip")
