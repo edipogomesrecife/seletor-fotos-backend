@@ -119,44 +119,32 @@ def process_session_photos(session_id: str):
         cursor.execute("UPDATE sessions SET processed_photos = processed_photos + 1 WHERE id = ?", (session_id,))
         conn.commit()
 
-    # 2. Agrupa todas as fotos semelhantes da mesma cena em clusters (evita efeito cascata)
-    n = len(analyzed_photos)
-    visited = [False] * n
+    # 2. Ordena todas as fotos da melhor para a pior ANTES de agrupar:
+    # Prioridade 1: Exposição 'Equilibrada' | Prioridade 2: Maior Nitidez
+    analyzed_photos.sort(
+        key=lambda x: (1 if x["exposure"] == "Equilibrada" else 0, x["blur"]),
+        reverse=True
+    )
 
+    # 3. A melhor foto de cada pose é mantida; qualquer outra muito parecida (distância <= 5) vira Duplicada
+    n = len(analyzed_photos)
     for i in range(n):
-        if visited[i]:
+        if analyzed_photos[i]["is_duplicate"] or analyzed_photos[i]["phash"] == "":
             continue
             
-        visited[i] = True
-        cluster = [analyzed_photos[i]]
+        hash_i = imagehash.hex_to_hash(analyzed_photos[i]["phash"])
         
-        if analyzed_photos[i]["phash"] != "":
-            queue = [i]
-            while queue:
-                curr = queue.pop(0)
-                hash_curr = imagehash.hex_to_hash(analyzed_photos[curr]["phash"])
+        for j in range(i + 1, n):
+            if analyzed_photos[j]["is_duplicate"] or analyzed_photos[j]["phash"] == "":
+                continue
                 
-                for j in range(n):
-                    if not visited[j] and analyzed_photos[j]["phash"] != "":
-                        hash_j = imagehash.hex_to_hash(analyzed_photos[j]["phash"])
-                        if (hash_curr - hash_j) <= 10:
-                            visited[j] = True
-                            queue.append(j)
-                            cluster.append(analyzed_photos[j])
+            hash_j = imagehash.hex_to_hash(analyzed_photos[j]["phash"])
+            
+            # Distância <= 5 agrupa apenas rajadas idênticas sem misturar poses diferentes no mesmo cenário
+            if (hash_i - hash_j) <= 5:
+                analyzed_photos[j]["is_duplicate"] = True
 
-        # Se houver mais de 1 foto no grupo de semelhantes, elege obrigatoriamente uma única vencedora
-        if len(cluster) > 1:
-            # Critério 1: Iluminação 'Equilibrada' (1) tem prioridade sobre Sub/Superexposta (0)
-            # Critério 2: Maior pontuação de nitidez (blur)
-            cluster.sort(
-                key=lambda x: (1 if x["exposure"] == "Equilibrada" else 0, x["blur"]),
-                reverse=True
-            )
-            # A primeira do ranking (cluster[0]) é mantida como principal; as demais viram Duplicada
-            for dup in cluster[1:]:
-                dup["is_duplicate"] = True
-
-    # 3. Atualiza os status no Banco de Dados
+    # 4. Atualiza os status no Banco de Dados
     for item in analyzed_photos:
         if item["is_duplicate"]:
             recommendation = "Duplicada"
